@@ -196,3 +196,7 @@ The model automatically detects the spoken language from the audio content. No l
 ## Model Architecture Reference
 
 See [docs/models/asr-model.md](../models/asr-model.md) for detailed architecture documentation including layer dimensions, weight formats, and quantization details.
+
+### Cancellation
+
+MLX transcription checks Swift task cancellation before encoding, prefill, and between decoder steps. An in-flight GPU operation finishes before cancellation takes effect. The synchronous API may return an empty or partial transcript on cancellation; async callers should call `Task.checkCancellation()` after transcription before accepting the result.
