@@ -341,6 +341,129 @@ public class CoreMLASRModel {
     }
 }
 
+// MARK: - Local loading and Core ML-only transcription with context
+
+extension CoreMLASRModel {
+    /// Loads a model whose files are already in `directory`: `encoder.mlmodelc`,
+    /// `embedding.mlmodelc`, `decoder_part1.mlmodelc`, `decoder_part2.mlmodelc`,
+    /// `config.json`, and the tokenizer's `vocab.json` and `merges.txt`.
+    /// Never downloads.
+    ///
+    /// - Throws: When a model file is missing or Core ML cannot load it.
+    public static func load(
+        from directory: URL,
+        encoderComputeUnits: MLComputeUnits,
+        decoderComputeUnits: MLComputeUnits
+    ) throws -> CoreMLASRModel {
+        let model = CoreMLASRModel(
+            encoder: try CoreMLASREncoder.load(from: directory, computeUnits: encoderComputeUnits),
+            decoder: try CoreMLTextDecoder.load(from: directory, computeUnits: decoderComputeUnits)
+        )
+        let tokenizer = Qwen3Tokenizer()
+        try tokenizer.load(from: directory.appendingPathComponent("vocab.json"))
+        model.tokenizer = tokenizer
+        return model
+    }
+
+    /// Transcribes up to 30 s of audio with Core ML alone, so it is safe
+    /// where Metal is not, such as an iOS app in the background.
+    ///
+    /// Unlike ``transcribeWithoutMLX(audio:sampleRate:language:maxTokens:)``,
+    /// the prompt and audio prefill in batches of the decoder's fixed width
+    /// rather than one call per token.
+    ///
+    /// - Parameters:
+    ///   - context: Text placed in the system turn, as the MLX model places
+    ///     it, such as a list of preferred spellings. Tokens past what fits
+    ///     beside the audio and `reservedForText` are dropped from its end.
+    ///   - reservedForText: Cache positions kept free for the transcript.
+    /// - Returns: The transcript, without the model's language tag.
+    /// - Throws: `CancellationError` when the calling task is cancelled,
+    ///   `AudioModelError` when the audio is longer than 30 s, or what Core ML throws.
+    public func transcribeOnCoreML(
+        audio: [Float],
+        sampleRate: Int = 16000,
+        language: String? = nil,
+        context: String? = nil,
+        reservedForText: Int = 256
+    ) throws -> String {
+        let T = Qwen3ASRTokens.self
+        let mel = featureExtractor.processRaw(audio, sampleRate: sampleRate)
+        let encoded = try encoder.encode(melFeatures: mel)
+        try Task.checkCancellation()
+
+        let head = [T.imStartTokenId, T.systemTokenId, T.newlineTokenId].map { Int32($0) }
+        let afterContext = [
+            T.imEndTokenId, T.newlineTokenId,
+            T.imStartTokenId, T.userTokenId, T.newlineTokenId, T.audioStartTokenId,
+        ].map { Int32($0) }
+        var suffix = [
+            T.audioEndTokenId, T.imEndTokenId, T.newlineTokenId,
+            T.imStartTokenId, T.assistantTokenId, T.newlineTokenId,
+        ].map { Int32($0) }
+        if let language, let tokenizer {
+            suffix += tokenizer.encode("language \(language)").map { Int32($0) }
+        }
+        suffix.append(Int32(T.asrTextTokenId))
+
+        let fixed = head.count + afterContext.count + encoded.outputLength + suffix.count
+        let room = max(0, decoder.realTokenCapacity - fixed - reservedForText)
+        var contextTokens: [Int32] = []
+        if let context, !context.isEmpty, let tokenizer {
+            contextTokens = Array(tokenizer.encode(context).prefix(room).map { Int32($0) })
+        }
+
+        decoder.resetCache()
+        _ = try decoder.decoderPrefillTokens(head + contextTokens + afterContext)
+        let audioEmbeddings = Self.rows(of: encoded.embeddings, count: encoded.outputLength, hidden: decoder.embeddingWidth)
+        var consumed = 0
+        while consumed < encoded.outputLength {
+            try Task.checkCancellation()
+            let n = min(decoder.prefillBatchSize, encoded.outputLength - consumed)
+            _ = try decoder.decoderPrefill(flatEmbeddings: audioEmbeddings, offset: consumed, realCount: n)
+            consumed += n
+        }
+        var logits = try decoder.decoderPrefillTokens(suffix)
+
+        let used = fixed + contextTokens.count
+        let maxNewTokens = max(0, decoder.realTokenCapacity - used - 1)
+        let imEnd = Int32(T.imEndTokenId)
+        var next = decoder.argmax(logits: logits)
+        // An end on the first token would be an empty transcript of real speech.
+        if next == imEnd { next = decoder.argmax(logits: logits, skipping: imEnd) }
+        var generated: [Int32] = []
+        while next != imEnd && generated.count < maxNewTokens {
+            try Task.checkCancellation()
+            generated.append(next)
+            logits = try decoder.decoderStep(embedding: try decoder.embed(tokenId: next))
+            next = decoder.argmax(logits: logits)
+        }
+
+        guard let tokenizer else { return generated.map { String($0) }.joined(separator: " ") }
+        let raw = tokenizer.decode(tokens: generated.map { Int($0) })
+        let text = raw.range(of: "<asr_text>").map { String(raw[$0.upperBound...]) } ?? raw
+        return text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// The first `count` rows of an encoder output as contiguous Float32,
+    /// whatever its element type and strides. ANE outputs are often Float16
+    /// with padded rows.
+    private static func rows(of array: MLMultiArray, count: Int, hidden: Int) -> [Float] {
+        let rowStride = array.strides[array.strides.count - 2].intValue
+        let lastStride = array.strides[array.strides.count - 1].intValue
+        var out = [Float](repeating: 0, count: count * hidden)
+        for row in 0..<count {
+            for j in 0..<hidden {
+                let i = row * rowStride + j * lastStride
+                out[row * hidden + j] = array.dataType == .float16
+                    ? Float(array.dataPointer.assumingMemoryBound(to: Float16.self)[i])
+                    : array.dataPointer.assumingMemoryBound(to: Float.self)[i]
+            }
+        }
+        return out
+    }
+}
+
 // MARK: - SpeechRecognitionModel
 
 extension CoreMLASRModel: SpeechRecognitionModel {

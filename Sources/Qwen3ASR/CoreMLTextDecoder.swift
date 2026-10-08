@@ -446,6 +446,14 @@ public class CoreMLTextDecoder {
     /// Expose the fixed batch size so callers can chunk audio prefill.
     public var prefillBatchSize: Int { batchSize }
 
+    /// How many real tokens one transcription can hold: prompt, audio and
+    /// generated text together. The last ``batchSize - 1`` cache slots are
+    /// scratch for single-token steps.
+    public var realTokenCapacity: Int { maxSeqLength - (batchSize - 1) }
+
+    /// Width of one embedding row the decoder takes.
+    public var embeddingWidth: Int { hiddenSize }
+
     /// Get argmax token ID, optionally excluding a single token.
     ///
     /// When ``skipToken`` is non-nil, the slot at that index is ignored —
