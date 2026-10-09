@@ -13,12 +13,16 @@ final class WhisperCoreMLRuntime: @unchecked Sendable {
     private let modelFolder: URL
     private let melModel: MLModel
     private let encoderModel: MLModel
-    private let decoderPrefillModel: MLModel
+    /// Only some bundles ship it; without it the opening tokens go through
+    /// the decoder one at a time.
+    private let decoderPrefillModel: MLModel?
     private let decoderModel: MLModel
     private let tokenizer: WhisperByteLevelTokenizer
     private let generationConfig: WhisperGenerationConfig
 
     private let maxAudioSamples = 480_000
+    /// Room kept for a 30 s window's transcript when a prompt shares the cache.
+    private let reservedTranscriptTokens = 160
     // Native greedy decoding has no temperature fallback yet; stop obvious
     // repeated-word loops before they dominate the transcription.
     private let maxRepeatedWordRun = 2
@@ -26,17 +30,22 @@ final class WhisperCoreMLRuntime: @unchecked Sendable {
     private let cacheLength: Int
     private let vocabSize: Int
 
-    init(modelFolder: URL) throws {
+    init(modelFolder: URL, computeUnits: WhisperComputeUnits = .default) throws {
         self.modelFolder = modelFolder
         let melConfig = MLModelConfiguration()
-        melConfig.computeUnits = .cpuAndGPU
-        let neuralConfig = MLModelConfiguration()
-        neuralConfig.computeUnits = .cpuAndNeuralEngine
+        melConfig.computeUnits = computeUnits.melSpectrogram
+        let encoderConfig = MLModelConfiguration()
+        encoderConfig.computeUnits = computeUnits.encoder
+        let decoderConfig = MLModelConfiguration()
+        decoderConfig.computeUnits = computeUnits.decoder
 
         self.melModel = try Self.loadModel("MelSpectrogram.mlmodelc", from: modelFolder, configuration: melConfig)
-        self.encoderModel = try Self.loadModel("AudioEncoder.mlmodelc", from: modelFolder, configuration: neuralConfig)
-        self.decoderPrefillModel = try Self.loadModel("TextDecoderContextPrefill.mlmodelc", from: modelFolder, configuration: neuralConfig)
-        self.decoderModel = try Self.loadModel("TextDecoder.mlmodelc", from: modelFolder, configuration: neuralConfig)
+        self.encoderModel = try Self.loadModel("AudioEncoder.mlmodelc", from: modelFolder, configuration: encoderConfig)
+        let prefillURL = modelFolder.appendingPathComponent(WhisperASRModel.prefillModelName)
+        self.decoderPrefillModel = FileManager.default.fileExists(atPath: prefillURL.path)
+            ? try Self.loadModel(WhisperASRModel.prefillModelName, from: modelFolder, configuration: decoderConfig)
+            : nil
+        self.decoderModel = try Self.loadModel("TextDecoder.mlmodelc", from: modelFolder, configuration: decoderConfig)
         self.tokenizer = try WhisperByteLevelTokenizer(modelFolder: modelFolder)
         self.generationConfig = try WhisperGenerationConfig.load(from: modelFolder)
 
@@ -47,10 +56,25 @@ final class WhisperCoreMLRuntime: @unchecked Sendable {
         self.vocabSize = decoderOutputs["logits"]?.multiArrayConstraint?.shape.last?.intValue ?? 51_866
     }
 
-    func transcribe(audio: [Float], languageHint: String?) throws -> WhisperTranscription {
+    /// The longest prompt that still leaves a window room for its transcript.
+    /// Whisper itself caps a prompt at half its context.
+    var maximumPromptTokens: Int {
+        let opening = 1 + 4
+        return max(0, min(cacheLength / 2 - 1, cacheLength - 1 - opening - reservedTranscriptTokens))
+    }
+
+    func promptTokens(for prompt: String) -> [Int] {
+        let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? [] : tokenizer.encode(" " + trimmed)
+    }
+
+    /// `prompt` reads as text spoken just before the audio, which steers
+    /// spelling. Past ``maximumPromptTokens`` its start is dropped, as Whisper does.
+    func transcribe(audio: [Float], languageHint: String?, prompt: String? = nil) throws -> WhisperTranscription {
         guard !audio.isEmpty else {
             return WhisperTranscription(text: "", language: languageHint)
         }
+        let promptTokens = Array(promptTokens(for: prompt ?? "").suffix(maximumPromptTokens))
 
         var offset = 0
         var texts: [String] = []
@@ -60,7 +84,7 @@ final class WhisperCoreMLRuntime: @unchecked Sendable {
             let end = min(offset + maxAudioSamples, audio.count)
             let chunk = Array(audio[offset..<end])
             let result = try autoreleasepool {
-                try transcribeChunk(audio: chunk, languageHint: languageHint ?? resolvedLanguage)
+                try transcribeChunk(audio: chunk, languageHint: languageHint ?? resolvedLanguage, promptTokens: promptTokens)
             }
             if !result.text.isEmpty {
                 texts.append(result.text)
@@ -76,7 +100,7 @@ final class WhisperCoreMLRuntime: @unchecked Sendable {
             language: resolvedLanguage ?? languageHint)
     }
 
-    private func transcribeChunk(audio: [Float], languageHint: String?) throws -> WhisperTranscription {
+    private func transcribeChunk(audio: [Float], languageHint: String?, promptTokens: [Int]) throws -> WhisperTranscription {
         let audioArray = try makeAudioArray(audio)
         let melOutput = try melModel.prediction(from: MLDictionaryFeatureProvider(dictionary: [
             "audio": MLFeatureValue(multiArray: audioArray),
@@ -94,8 +118,7 @@ final class WhisperCoreMLRuntime: @unchecked Sendable {
 
         let languageToken = try resolveLanguageToken(languageHint, encoderEmbeds: encoderEmbeds)
         let language = generationConfig.languageCode(forToken: languageToken)
-        let state = try makeDecoderState(languageToken: languageToken)
-        let generated = try decodeGreedy(encoderEmbeds: encoderEmbeds, state: state)
+        let generated = try decode(encoderEmbeds: encoderEmbeds, languageToken: languageToken, promptTokens: promptTokens)
 
         return WhisperTranscription(
             text: tokenizer.decode(generated).trimmingCharacters(in: .whitespacesAndNewlines),
@@ -112,29 +135,31 @@ final class WhisperCoreMLRuntime: @unchecked Sendable {
 
     private func detectLanguageToken(encoderEmbeds: MLMultiArray) throws -> Int {
         let state = try makeEmptyDecoderState()
-        state.inputIds[0] = NSNumber(value: Int32(generationConfig.startOfTranscriptToken))
-        state.cacheLength[0] = NSNumber(value: Int32(0))
-
-        setFloat16(state.kvCacheUpdateMask, at: 0, to: 1)
-        setFloat16(state.decoderKeyPaddingMask, at: 0, to: 0)
-
-        let output = try predictDecoder(encoderEmbeds: encoderEmbeds, state: state)
-        guard let logits = output.featureValue(for: "logits")?.multiArrayValue else {
-            throw AudioModelError.inferenceFailed(operation: "Whisper language detection", reason: "Missing logits")
-        }
-
+        let logits = try step(generationConfig.startOfTranscriptToken, at: 0, encoderEmbeds: encoderEmbeds, state: state)
         return argmax(logits: logits, allowed: generationConfig.languageTokenSet)
             ?? generationConfig.englishToken
     }
 
-    private func makeDecoderState(languageToken: Int) throws -> DecoderState {
+    private func decode(encoderEmbeds: MLMultiArray, languageToken: Int, promptTokens: [Int]) throws -> [Int] {
         let state = try makeEmptyDecoderState()
+        let opening = [generationConfig.startOfTranscriptToken, languageToken, generationConfig.transcribeToken]
+        if promptTokens.isEmpty, let decoderPrefillModel {
+            try prefill(state, languageToken: languageToken, using: decoderPrefillModel)
+            return try decodeGreedy(encoderEmbeds: encoderEmbeds, state: state, from: opening.count)
+        }
+        let prefix = (promptTokens.isEmpty ? [] : [tokenizer.startOfPreviousToken] + promptTokens) + opening
+        for (index, token) in prefix.enumerated() {
+            _ = try step(token, at: index, encoderEmbeds: encoderEmbeds, state: state)
+        }
+        return try decodeGreedy(encoderEmbeds: encoderEmbeds, state: state, from: prefix.count)
+    }
 
+    private func prefill(_ state: DecoderState, languageToken: Int, using model: MLModel) throws {
         let prefillInputs = try MLDictionaryFeatureProvider(dictionary: [
             "language": MLFeatureValue(multiArray: scalarInt32(languageToken)),
             "task": MLFeatureValue(multiArray: scalarInt32(generationConfig.transcribeTaskIndex)),
         ])
-        let prefillOutput = try decoderPrefillModel.prediction(from: prefillInputs)
+        let prefillOutput = try model.prediction(from: prefillInputs)
         guard let keyPrefill = prefillOutput.featureValue(for: "key_cache_prefill")?.multiArrayValue,
               let valuePrefill = prefillOutput.featureValue(for: "value_cache_prefill")?.multiArrayValue
         else {
@@ -143,32 +168,20 @@ final class WhisperCoreMLRuntime: @unchecked Sendable {
 
         copyCacheSlice(keyPrefill, into: state.keyCache, tokenCount: generationConfig.prefillCacheTokenCount)
         copyCacheSlice(valuePrefill, into: state.valueCache, tokenCount: generationConfig.prefillCacheTokenCount)
-
-        for index in 0...generationConfig.prefillCacheTokenCount {
+        for index in 0..<generationConfig.prefillCacheTokenCount {
             setFloat16(state.decoderKeyPaddingMask, at: index, to: 0)
         }
-        setFloat16(state.kvCacheUpdateMask, at: generationConfig.prefillCacheTokenCount, to: 1)
-        return state
     }
 
-    private func decodeGreedy(encoderEmbeds: MLMultiArray, state: DecoderState) throws -> [Int] {
+    /// Greedy decoding after the opening, which fills positions `0..<start`.
+    private func decodeGreedy(encoderEmbeds: MLMultiArray, state: DecoderState, from start: Int) throws -> [Int] {
         var generated: [Int] = []
         var nextToken = generationConfig.noTimestampsToken
-        var tokenIndex = generationConfig.prefillCacheTokenCount
+        var tokenIndex = start
         let maxTokenIndex = cacheLength - 1
 
         while tokenIndex < maxTokenIndex {
-            state.inputIds[0] = NSNumber(value: Int32(nextToken))
-            state.cacheLength[0] = NSNumber(value: Int32(tokenIndex))
-
-            let output = try predictDecoder(encoderEmbeds: encoderEmbeds, state: state)
-            guard let logits = output.featureValue(for: "logits")?.multiArrayValue,
-                  let keyUpdate = output.featureValue(for: "key_cache_updates")?.multiArrayValue,
-                  let valueUpdate = output.featureValue(for: "value_cache_updates")?.multiArrayValue
-            else {
-                throw AudioModelError.inferenceFailed(operation: "Whisper decoder", reason: "Missing decoder outputs")
-            }
-
+            let logits = try step(nextToken, at: tokenIndex, encoderEmbeds: encoderEmbeds, state: state)
             let sampled = argmax(logits: logits, generatedTokens: generated)
             if sampled == generationConfig.endToken {
                 break
@@ -182,18 +195,34 @@ final class WhisperCoreMLRuntime: @unchecked Sendable {
                 generated = candidate
             }
 
-            copyCacheUpdate(keyUpdate, into: state.keyCache, at: tokenIndex)
-            copyCacheUpdate(valueUpdate, into: state.valueCache, at: tokenIndex)
-
-            setFloat16(state.decoderKeyPaddingMask, at: tokenIndex + 1, to: 0)
-            setFloat16(state.kvCacheUpdateMask, at: tokenIndex, to: 0)
-            setFloat16(state.kvCacheUpdateMask, at: tokenIndex + 1, to: 1)
-
             nextToken = sampled
             tokenIndex += 1
         }
 
         return generated
+    }
+
+    /// Runs `token` through the decoder at `index`, keeps its keys and
+    /// values in the cache, and returns the logits for the next position.
+    private func step(_ token: Int, at index: Int, encoderEmbeds: MLMultiArray, state: DecoderState) throws -> MLMultiArray {
+        try Task.checkCancellation()
+        state.inputIds[0] = NSNumber(value: Int32(token))
+        state.cacheLength[0] = NSNumber(value: Int32(index))
+        setFloat16(state.decoderKeyPaddingMask, at: index, to: 0)
+        setFloat16(state.kvCacheUpdateMask, at: index, to: 1)
+
+        let output = try predictDecoder(encoderEmbeds: encoderEmbeds, state: state)
+        guard let logits = output.featureValue(for: "logits")?.multiArrayValue,
+              let keyUpdate = output.featureValue(for: "key_cache_updates")?.multiArrayValue,
+              let valueUpdate = output.featureValue(for: "value_cache_updates")?.multiArrayValue
+        else {
+            throw AudioModelError.inferenceFailed(operation: "Whisper decoder", reason: "Missing decoder outputs")
+        }
+
+        copyCacheUpdate(keyUpdate, into: state.keyCache, at: index)
+        copyCacheUpdate(valueUpdate, into: state.valueCache, at: index)
+        setFloat16(state.kvCacheUpdateMask, at: index, to: 0)
+        return logits
     }
 
     private func predictDecoder(encoderEmbeds: MLMultiArray, state: DecoderState) throws -> MLFeatureProvider {
