@@ -23,9 +23,6 @@ final class WhisperCoreMLRuntime: @unchecked Sendable {
     private let maxAudioSamples = 480_000
     /// Room kept for a 30 s window's transcript when a prompt shares the cache.
     private let reservedTranscriptTokens = 160
-    // Native greedy decoding has no temperature fallback yet; stop obvious
-    // repeated-word loops before they dominate the transcription.
-    private let maxRepeatedWordRun = 2
     private let cacheDim: Int
     private let cacheLength: Int
     private let vocabSize: Int
@@ -175,31 +172,10 @@ final class WhisperCoreMLRuntime: @unchecked Sendable {
 
     /// Greedy decoding after the opening, which fills positions `0..<start`.
     private func decodeGreedy(encoderEmbeds: MLMultiArray, state: DecoderState, from start: Int) throws -> [Int] {
-        var generated: [Int] = []
-        var nextToken = generationConfig.noTimestampsToken
-        var tokenIndex = start
-        let maxTokenIndex = cacheLength - 1
-
-        while tokenIndex < maxTokenIndex {
-            let logits = try step(nextToken, at: tokenIndex, encoderEmbeds: encoderEmbeds, state: state)
-            let sampled = argmax(logits: logits, generatedTokens: generated)
-            if sampled == generationConfig.endToken {
-                break
-            }
-
-            if sampled < generationConfig.specialTokenBegin {
-                let candidate = generated + [sampled]
-                if shouldStopForRepeatedWords(candidate) {
-                    break
-                }
-                generated = candidate
-            }
-
-            nextToken = sampled
-            tokenIndex += 1
+        try WhisperGreedyDecoder.decode(from: start, cacheLength: cacheLength, config: generationConfig) { token, index, generated in
+            let logits = try step(token, at: index, encoderEmbeds: encoderEmbeds, state: state)
+            return argmax(logits: logits, generatedTokens: generated)
         }
-
-        return generated
     }
 
     /// Runs `token` through the decoder at `index`, keeps its keys and
@@ -297,44 +273,6 @@ final class WhisperCoreMLRuntime: @unchecked Sendable {
         argmax(logits: logits) { token in
             !allowed.contains(token)
         }
-    }
-
-    private func shouldStopForRepeatedWords(_ tokens: [Int]) -> Bool {
-        guard tokens.count >= maxRepeatedWordRun + 1 else {
-            return false
-        }
-
-        let words = normalizedWords(tokenizer.decode(tokens))
-        guard let last = words.last else {
-            return false
-        }
-
-        var runLength = 0
-        for word in words.reversed() {
-            if word == last {
-                runLength += 1
-            } else {
-                break
-            }
-        }
-        return runLength > maxRepeatedWordRun
-    }
-
-    private func normalizedWords(_ text: String) -> [String] {
-        var words: [String] = []
-        var current = ""
-        for scalar in text.lowercased().unicodeScalars {
-            if CharacterSet.letters.contains(scalar) || CharacterSet.decimalDigits.contains(scalar) {
-                current.unicodeScalars.append(scalar)
-            } else if !current.isEmpty {
-                words.append(current)
-                current.removeAll(keepingCapacity: true)
-            }
-        }
-        if !current.isEmpty {
-            words.append(current)
-        }
-        return words
     }
 
     private func argmax(logits: MLMultiArray, shouldSkip: (Int) -> Bool) -> Int? {

@@ -30,7 +30,7 @@ If the caller passes `language`, the runtime uses the matching Whisper language 
 
 `TextDecoderContextPrefill.mlmodelc` creates the cache for language and task tokens. `TextDecoder.mlmodelc` then generates tokens one step at a time, with explicit `key_cache`, `value_cache`, cache masks, and cache-length updates supplied by Swift.
 
-The current decoder uses greedy no-timestamp generation. It suppresses special tokens and stops on the end token, with a narrow repeated-word guard for obvious hallucination loops.
+The current decoder uses greedy no-timestamp generation. It suppresses special tokens and returns a transcript only after the end token. Repeated words are preserved, including runs of three or more. If the decoder context fills before the end token, the throwing transcription APIs report `AudioModelError.inferenceFailed` instead of returning partial text. Prompt tokens share that context with the transcript, so a large prompt can make a window exhaust it. Cancellation remains `CancellationError`.
 
 ## CLI
 
