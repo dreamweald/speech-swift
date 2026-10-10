@@ -34,7 +34,8 @@ Current behavior:
 - Optional language hint, otherwise Whisper language-token detection.
 - Byte-level tokenizer decode from the model bundle.
 - 30 s chunking with per-chunk autorelease pools.
-- Repeated-word stop guard for obvious greedy hallucination loops.
+- Repeated speech is preserved; the decoder context bounds generation.
+- Throwing transcription APIs reject context exhaustion without an end token rather than returning partial text.
 
 Not yet implemented:
 

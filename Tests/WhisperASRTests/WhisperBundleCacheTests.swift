@@ -43,9 +43,47 @@ final class WhisperBundleCacheTests: XCTestCase {
         XCTAssertFalse(WhisperASRModel.hasCompleteCachedBundle(in: temporaryDirectory))
     }
 
-    private func createCompleteBundle() throws {
-        for relativePath in WhisperASRModel.requiredBundleFiles {
-            let fileURL = temporaryDirectory.appendingPathComponent(relativePath)
+    func testBundleWithoutPrefillIsAccepted() throws {
+        try createCompleteBundle()
+        try FileManager.default.removeItem(
+            at: temporaryDirectory.appendingPathComponent(WhisperASRModel.prefillModelName)
+        )
+
+        XCTAssertTrue(WhisperASRModel.hasCompleteCachedBundle(in: temporaryDirectory))
+    }
+
+    func testIncompletePrefillIsRejected() throws {
+        try createCompleteBundle()
+        try FileManager.default.removeItem(
+            at: temporaryDirectory.appendingPathComponent("\(WhisperASRModel.prefillModelName)/model.mil")
+        )
+
+        XCTAssertFalse(WhisperASRModel.hasCompleteCachedBundle(in: temporaryDirectory))
+    }
+
+    func testMissingTokenizerOnlyBlocksTheFullCheck() throws {
+        try createCompleteBundle()
+        try FileManager.default.removeItem(at: temporaryDirectory.appendingPathComponent("tokenizer.json"))
+
+        XCTAssertFalse(WhisperASRModel.hasCompleteCachedBundle(in: temporaryDirectory))
+        XCTAssertTrue(WhisperASRModel.hasCompleteCachedBundle(in: temporaryDirectory, includingTokenizer: false))
+    }
+
+    func testFolderBundleLivesInItsFolder() throws {
+        let bundle = WhisperBundle.argmax("openai_whisper-small_216MB", tokenizerRepository: "openai/whisper-small")
+        let folder = temporaryDirectory.appendingPathComponent("openai_whisper-small_216MB", isDirectory: true)
+        try createCompleteBundle(in: folder)
+
+        XCTAssertEqual(bundle.modelFolder(in: temporaryDirectory), folder)
+        XCTAssertEqual(bundle.repositoryPath("TextDecoder.mlmodelc/**"), "openai_whisper-small_216MB/TextDecoder.mlmodelc/**")
+        XCTAssertTrue(WhisperASRModel.isDownloaded(bundle, in: temporaryDirectory))
+        XCTAssertFalse(WhisperASRModel.isDownloaded(.largeV3Turbo, in: temporaryDirectory))
+    }
+
+    private func createCompleteBundle(in directory: URL? = nil) throws {
+        let directory = directory ?? temporaryDirectory!
+        for relativePath in WhisperASRModel.requiredBundleFiles + WhisperASRModel.prefillBundleFiles {
+            let fileURL = directory.appendingPathComponent(relativePath)
             try FileManager.default.createDirectory(
                 at: fileURL.deletingLastPathComponent(),
                 withIntermediateDirectories: true

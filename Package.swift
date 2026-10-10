@@ -923,7 +923,8 @@ let package = Package(
         ),
         .testTarget(
             name: "WhisperASRTests",
-            dependencies: ["WhisperASR"]
+            dependencies: ["WhisperASR", "AudioCommon"],
+            resources: [.copy("Resources")]
         ),
         .testTarget(
             name: "MossTranscribeTests",

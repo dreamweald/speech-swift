@@ -6,6 +6,7 @@ struct WhisperGenerationConfig: Sendable {
     let endToken: Int
     let englishToken: Int
     let transcribeToken: Int
+    let translateToken: Int
     let noTimestampsToken: Int
     let specialTokenBegin: Int
     let beginSuppressTokens: Set<Int>
@@ -17,8 +18,9 @@ struct WhisperGenerationConfig: Sendable {
         Set(languageTokensByCode.values)
     }
 
+    /// The prefill model takes the task as an index, translate first.
     var transcribeTaskIndex: Int {
-        max(0, transcribeToken - 50_359)
+        max(0, transcribeToken - translateToken)
     }
 
     var prefillCacheTokenCount: Int {
@@ -48,6 +50,7 @@ struct WhisperGenerationConfig: Sendable {
             endToken: raw.eosTokenId ?? 50_257,
             englishToken: languages["en"] ?? 50_259,
             transcribeToken: raw.taskToId["transcribe"] ?? 50_360,
+            translateToken: raw.taskToId["translate"] ?? 50_359,
             noTimestampsToken: raw.noTimestampsTokenId ?? 50_364,
             specialTokenBegin: raw.eosTokenId ?? 50_257,
             beginSuppressTokens: Set(raw.beginSuppressTokens ?? [220, raw.eosTokenId ?? 50_257]),
